@@ -1,11 +1,15 @@
 name: CI Pipeline
 
-on:
-  push:
-    branches: [main, develop]
-  pull_request:
-    branches: [main]
-  workflow_dispatch:
+ workflow_dispatch:
+    inputs:
+      environments:
+        description: "my first dispatch test"
+        default: staging
+        type: choice
+        options:
+          - staging
+          - prod
+
 
 env:
   NODE_VERSION: '20'
