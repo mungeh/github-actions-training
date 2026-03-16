@@ -89,3 +89,10 @@ jobs:
           name: build-output
           path: ./dist
           retention-days: 7
+      - name: deploying to staging
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: "deploying to staging"
+
+      - name: failure alert
+        if: failure()
+        run: echo "build faild"
