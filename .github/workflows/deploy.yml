@@ -7,7 +7,7 @@ jobs:
   use-reusble:
     uses: mungeh/github-actions-training/.github/workflows/reusble.yml@main
     with:
-      node-version: "20"
+      NODE_VERSION: '20'
 
   build:
     name: Build
