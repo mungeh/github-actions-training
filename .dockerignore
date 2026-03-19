@@ -1,0 +1,9 @@
+.env
+*.md
+.git
+coverage
+test-result
+.env.*
+dist
+npm-debug.log
+node_modules
