@@ -1,15 +1,10 @@
 name: CI Pipeline
 on:
 
- workflow_dispatch:
-    inputs:
-      environments:
-        description: "my first dispatch test"
-        default: staging
-        type: choice
-        options:
-          - staging
-          - prod
+ push:
+    branches: [main]
+
+    
 
 
 env:
