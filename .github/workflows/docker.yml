@@ -25,7 +25,10 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     outputs:
+      # Keep the full list of tags for reference
       image-tag: ${{ steps.meta.outputs.tags }}
+      # Single tag for scanning (first one)
+      scan-tag: ${{ steps.first-tag.outputs.tag }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -51,6 +54,13 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short
+
+      - name: Extract first tag for scanning
+        id: first-tag
+        run: |
+          # The tags output is newline-separated; take the first line
+          FIRST_TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
+          echo "tag=$FIRST_TAG" >> $GITHUB_OUTPUT
 
       - name: Build and push Docker image
         id: build
@@ -81,16 +91,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: RUN TRIVY VULNERABILITY SCAN
+      - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ needs.build-and-push.outputs.image-tag }}
+          # Use the single tag we output from the build job
+          image-ref: ${{ needs.build-and-push.outputs.scan-tag }}
           format: sarif
           output: trivy-results.sarif
           severity: HIGH,CRITICAL
           exit-code: 1
 
-      - name: upload trivy to results to github security tab
+      - name: Upload Trivy results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
