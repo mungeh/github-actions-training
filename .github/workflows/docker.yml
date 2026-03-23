@@ -1,10 +1,12 @@
 name: Docker build and push
 
 on:
-  workflow_run:
-    workflows: ["CI Pipeline"]      # Exact name of your CI workflow
-    types: [completed]              # Trigger when CI completes
-    branches: [main]                # Only for CI runs on main
+  push:
+    branches: [main]
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    branches: [main]
 
 concurrency:
   group: docker-${{ github.ref }}
@@ -22,8 +24,6 @@ env:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-    # Only run if CI succeeded OR it's a tag push (if you add that later)
-    if: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' }}
     outputs:
       image-tag: ${{ steps.meta.outputs.tags }}
     steps:
@@ -46,18 +46,21 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short
 
       - name: Build and push Docker image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          sbom: true
+          provenance: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-  
