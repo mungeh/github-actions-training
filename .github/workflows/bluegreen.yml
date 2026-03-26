@@ -1,0 +1,282 @@
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: ["Docker Build & Push"]
+    types:
+      - completed
+    branches: [main]
+
+  # Allow manual deployment to any environment
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+      image-tag:
+        description: 'Image tag to deploy (default: latest)'
+        required: false
+        default: 'latest'
+
+concurrency:
+  group: deploy-${{ github.event.inputs.environment || 'development' }}
+  cancel-in-progress: false    # never cancel a deployment mid-flight
+
+permissions:
+  contents: read
+  id-token: write              # required for OIDC authentication
+  deployments: write           # required to create GitHub deployment records
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+
+  # ─────────────────────────────────────────────
+  # Gate: only proceed if Docker build succeeded
+  # ─────────────────────────────────────────────
+  check-build:
+    name: ✅ Verify Build Success
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Confirm build status
+        run: echo "Build verified — proceeding with deployment"
+
+  # ─────────────────────────────────────────────
+  # Stage 1: Deploy to Development
+  # ─────────────────────────────────────────────
+  deploy-development:
+    name: 🚀 Deploy → Development
+    runs-on: ubuntu-latest
+    needs: check-build
+    environment:
+      name: development
+      url: ${{ vars.APP_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine image tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.image-tag || 'latest' }}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "image=ghcr.io/${{ env.IMAGE_NAME }}:$TAG" >> $GITHUB_OUTPUT
+
+      - name: Deploy to ECS — Development
+        run: |
+          aws ecs update-service \
+            --cluster calculator-dev \
+            --service calculator-service \
+            --force-new-deployment \
+            --region us-east-1
+
+      - name: Wait for deployment to stabilize
+        run: |
+          aws ecs wait services-stable \
+            --cluster calculator-dev \
+            --services calculator-service \
+            --region us-east-1
+
+      - name: Run smoke tests against development
+        run: |
+          sleep 10
+          curl --fail ${{ vars.APP_URL }}/health || exit 1
+
+  # ─────────────────────────────────────────────
+  # Stage 2: Deploy to Staging
+  # ─────────────────────────────────────────────
+  deploy-staging:
+    name: 🚀 Deploy → Staging
+    runs-on: ubuntu-latest
+    needs: deploy-development
+    environment:
+      name: staging
+      url: ${{ vars.APP_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Blue-Green Deploy to Staging
+        id: bluegreen
+        run: |
+          # Determine which target group is currently live
+          LIVE=$(aws elbv2 describe-rules \
+            --listener-arn ${{ secrets.STAGING_LISTENER_ARN }} \
+            --query 'Rules[?Priority==1].Actions[0].TargetGroupArn' \
+            --output text)
+
+          if [[ "$LIVE" == "blue" ]]; then
+            DEPLOY_TO="green"
+            SWITCH_TO="blue"
+          else
+            DEPLOY_TO="blue"
+            SWITCH_TO="green"
+          fi
+
+          echo "deploy-color=$DEPLOY_TO" >> $GITHUB_OUTPUT
+          echo "Deploying to $DEPLOY_TO target group"
+
+          # Update the idle ECS service with the new image
+          aws ecs update-service \
+            --cluster calculator-staging \
+            --service calculator-$DEPLOY_TO \
+            --force-new-deployment \
+            --region us-east-1
+
+          # Wait until the new version is stable
+          aws ecs wait services-stable \
+            --cluster calculator-staging \
+            --services calculator-$DEPLOY_TO
+
+      - name: Run smoke tests against idle slot before switching
+        run: |
+          COLOR=${{ steps.bluegreen.outputs.deploy-color }}
+          curl --fail ${{ vars.STAGING_INTERNAL_URL }}-$COLOR/health || exit 1
+          echo "Smoke tests passed on $COLOR slot"
+
+      - name: Switch load balancer to new version
+        run: |
+          COLOR=${{ steps.bluegreen.outputs.deploy-color }}
+          aws elbv2 modify-rule \
+            --rule-arn ${{ secrets.STAGING_RULE_ARN }} \
+            --actions Type=forward,TargetGroupArn=${{ secrets.STAGING_TG_ARN_PREFIX }}-$COLOR \
+            --region us-east-1
+          echo "Traffic switched to $COLOR"
+
+      - name: Run post-switch smoke tests
+        run: |
+          sleep 15
+          curl --fail ${{ vars.APP_URL }}/health || exit 1
+
+  # ─────────────────────────────────────────────
+  # Stage 3: Manual Approval Gate
+  # ─────────────────────────────────────────────
+  # The 'production' environment in GitHub has Required Reviewers configured.
+  # When this job starts, GitHub automatically pauses it and sends
+  # an approval notification. No additional workflow code needed.
+  # ─────────────────────────────────────────────
+
+  deploy-production:
+    name: 🚀 Deploy → Production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    environment:
+      name: production           # ← GitHub pauses here and waits for approval
+      url: ${{ vars.APP_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Blue-Green Deploy to Production
+        id: bluegreen
+        run: |
+          LIVE=$(aws elbv2 describe-rules \
+            --listener-arn ${{ secrets.PROD_LISTENER_ARN }} \
+            --query 'Rules[?Priority==1].Actions[0].TargetGroupArn' \
+            --output text)
+
+          if [[ "$LIVE" == "blue" ]]; then
+            DEPLOY_TO="green"
+          else
+            DEPLOY_TO="blue"
+          fi
+
+          echo "deploy-color=$DEPLOY_TO" >> $GITHUB_OUTPUT
+
+          aws ecs update-service \
+            --cluster calculator-production \
+            --service calculator-$DEPLOY_TO \
+            --force-new-deployment \
+            --region us-east-1
+
+          aws ecs wait services-stable \
+            --cluster calculator-production \
+            --services calculator-$DEPLOY_TO
+
+      - name: Smoke test new version before switching
+        run: |
+          COLOR=${{ steps.bluegreen.outputs.deploy-color }}
+          curl --fail ${{ vars.PROD_INTERNAL_URL }}-$COLOR/health || exit 1
+
+      - name: Switch production traffic
+        run: |
+          COLOR=${{ steps.bluegreen.outputs.deploy-color }}
+          aws elbv2 modify-rule \
+            --rule-arn ${{ secrets.PROD_RULE_ARN }} \
+            --actions Type=forward,TargetGroupArn=${{ secrets.PROD_TG_ARN_PREFIX }}-$COLOR
+          echo "Production traffic switched to $COLOR"
+
+      - name: Post-deployment verification
+        run: |
+          sleep 30
+          curl --fail ${{ vars.APP_URL }}/health || exit 1
+          echo "Production deployment verified"
+
+      - name: Notify team on success
+        if: success()
+        run: |
+          echo "Deployment successful — would send Slack notification here"
+          echo "Image: ghcr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          echo "Environment: production"
+          echo "Deployed by: ${{ github.actor }}"
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "Deployment failed — initiating rollback"
+          COLOR=${{ steps.bluegreen.outputs.deploy-color }}
+          # Switch traffic back to the previously live slot
+          if [[ "$COLOR" == "green" ]]; then ROLLBACK="blue"; else ROLLBACK="green"; fi
+          aws elbv2 modify-rule \
+            --rule-arn ${{ secrets.PROD_RULE_ARN }} \
+            --actions Type=forward,TargetGroupArn=${{ secrets.PROD_TG_ARN_PREFIX }}-$ROLLBACK
+          echo "Rolled back to $ROLLBACK"
